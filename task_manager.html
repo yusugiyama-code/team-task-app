@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>タスク＆ガントチャート管理アプリ</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f3f4f6;
+        }
+        .gantt-chart-container {
+            overflow-x: auto;
+            white-space: nowrap;
+            padding: 16px;
+            background-color: #ffffff;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .gantt-row {
+            display: flex;
+            align-items: center;
+            height: 30px;
+            margin-bottom: 8px;
+            position: relative;
+        }
+        .gantt-row-label {
+            width: 150px;
+            flex-shrink: 0;
+            padding-right: 16px;
+            font-size: 14px;
+            color: #4b5563;
+        }
+        .gantt-bar {
+            position: absolute;
+            height: 20px;
+            border-radius: 9999px;
+            transition: all 0.3s ease;
+        }
+        .status-not-started {
+            background-color: #9ca3af;
+        }
+        .status-in-progress {
+            background-color: #2563eb;
+        }
+        .status-completed {
+            background-color: #10b981;
+        }
+        .gantt-timeline {
+            display: flex;
+            margin-left: 150px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #e5e7eb;
+        }
+        .timeline-day {
+            width: 50px;
+            text-align: center;
+            font-size: 12px;
+            color: #6b7280;
+            flex-shrink: 0;
+        }
+        .modal-content {
+            background-color: #ffffff;
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: 0 10px 15px rgba(0, 0, 0, 0.1);
+        }
+        .button-icon {
+            background-color: transparent;
+            border: none;
+            padding: 8px;
+            cursor: pointer;
+            border-radius: 50%;
+            transition: background-color 0.2s;
+        }
+        .button-icon:hover {
+            background-color: #e5e7eb;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 p-6 sm:p-10">
+
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, onSnapshot, collection, query, orderBy, addDoc, updateDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Firebase Auth and Firestore Initialization
+        let db;
+        let auth;
+        let userId = 'loading...';
+        setLogLevel('debug');
+
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // UI status message element
+        let statusMessageElement;
+
+        // Function to update UI status messages
+        function setStatusMessage(message, color = 'text-gray-500') {
+            if (statusMessageElement) {
+                statusMessageElement.innerText = message;
+                statusMessageElement.className = `text-sm font-medium truncate ${color}`;
+            }
+        }
+
+        window.addEventListener('load', () => {
+            statusMessageElement = document.getElementById('user-id-display');
+            initializeFirebase();
+
+            document.getElementById('task-form').addEventListener('submit', (e) => {
+                e.preventDefault();
+                const taskData = {
+                    taskName: e.target.taskName.value,
+                    assignee: e.target.assignee.value,
+                    startDate: e.target.startDate.value,
+                    endDate: e.target.endDate.value,
+                    status: e.target.status.value
+                };
+                addTask(taskData);
+            });
+        });
+
+        function initializeFirebase() {
+            setStatusMessage('Firebaseに接続中...');
+            if (Object.keys(firebaseConfig).length > 0) {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                setStatusMessage('Firebaseに接続済み。認証を待機中...');
+
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        setStatusMessage(`ユーザーID: ${userId}`, 'text-green-600');
+                        initializeFirestoreListeners();
+                    } else {
+                        setStatusMessage("ユーザーを認証中...", 'text-yellow-600');
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken).catch((error) => {
+                                console.error("Custom token sign-in failed:", error);
+                                setStatusMessage("認証に失敗しました。匿名ユーザーで試行します。", 'text-red-600');
+                                signInAnonymously(auth).catch((anonError) => console.error("Anonymous sign-in failed:", anonError));
+                            });
+                        } else {
+                            await signInAnonymously(auth).catch((error) => {
+                                console.error("Anonymous sign-in failed:", error);
+                                setStatusMessage("匿名ログインに失敗しました。", 'text-red-600');
+                            });
+                        }
+                    }
+                });
+            } else {
+                console.error("Firebase config is missing.");
+                setStatusMessage('Firebaseが設定されていません。', 'text-red-600');
+            }
+        }
+
+        // --- Firestore Operations ---
+        function getCollectionPath() {
+            return `artifacts/${appId}/public/data/tasks`;
+        }
+        
+        // Listen for real-time changes to the tasks collection
+        function initializeFirestoreListeners() {
+            if (!db) {
+                console.error("Firestore is not initialized.");
+                return;
+            }
+            setStatusMessage('データベースに接続中...');
+            const q = collection(db, getCollectionPath());
+            onSnapshot(q, (snapshot) => {
+                const tasks = [];
+                snapshot.forEach((doc) => {
+                    tasks.push({ id: doc.id, ...doc.data() });
+                });
+                renderTasks(tasks);
+                renderGanttChart(tasks);
+                setStatusMessage('データベース接続完了');
+            }, (error) => {
+                console.error("Error fetching tasks:", error);
+                setStatusMessage("データベース接続エラー", 'text-red-600');
+            });
+        }
+
+        // Add a new task
+        async function addTask(taskData) {
+            if (!db) {
+                console.error("Firestore is not initialized. Cannot add task.");
+                setStatusMessage("データベースが利用できません。", 'text-red-600');
+                return;
+            }
+            try {
+                await addDoc(collection(db, getCollectionPath()), taskData);
+                document.getElementById('task-form').reset();
+            } catch (e) {
+                console.error("Error adding document: ", e);
+            }
+        }
+
+        // Update an existing task
+        async function updateTask(id, taskData) {
+            if (!db) return;
+            try {
+                const taskRef = doc(db, getCollectionPath(), id);
+                await updateDoc(taskRef, taskData);
+                closeModal();
+            } catch (e) {
+                console.error("Error updating document: ", e);
+            }
+        }
+
+        // Delete a task
+        async function deleteTask(id) {
+            if (!db) return;
+            try {
+                await deleteDoc(doc(db, getCollectionPath(), id));
+            } catch (e) {
+                console.error("Error deleting document: ", e);
+            }
+        }
+
+        // --- UI Rendering Functions ---
+
+        // Render the task list
+        function renderTasks(tasks) {
+            const taskList = document.getElementById('task-list');
+            taskList.innerHTML = '';
+            tasks.forEach(task => {
+                const row = document.createElement('tr');
+                row.className = 'bg-white border-b hover:bg-gray-50';
+                row.innerHTML = `
+                    <td class="px-6 py-4 font-medium text-gray-900">${task.taskName}</td>
+                    <td class="px-6 py-4 text-gray-500">${task.assignee}</td>
+                    <td class="px-6 py-4 text-gray-500">${task.startDate}</td>
+                    <td class="px-6 py-4 text-gray-500">${task.endDate}</td>
+                    <td class="px-6 py-4">
+                        <span class="text-sm font-semibold p-1 px-2 rounded-full ${getStatusClass(task.status)}">
+                            ${task.status}
+                        </span>
+                    </td>
+                    <td class="px-6 py-4 text-right flex items-center justify-end space-x-2">
+                        <button onclick="editTaskModal('${task.id}', '${task.taskName}', '${task.assignee}', '${task.startDate}', '${task.endDate}', '${task.status}')" class="text-blue-600 hover:text-blue-900 transition-colors duration-200">
+                            <i class="fas fa-edit"></i>
+                        </button>
+                        <button onclick="deleteTask('${task.id}')" class="text-red-600 hover:text-red-900 transition-colors duration-200">
+                            <i class="fas fa-trash"></i>
+                        </button>
+                    </td>
+                `;
+                taskList.appendChild(row);
+            });
+        }
+
+        function getStatusClass(status) {
+            switch (status) {
+                case '未着手': return 'bg-gray-200 text-gray-800';
+                case '進行中': return 'bg-blue-200 text-blue-800';
+                case '完了': return 'bg-green-200 text-green-800';
+                default: return '';
+            }
+        }
+
+        // Render the Gantt chart
+        function renderGanttChart(tasks) {
+            const chartDiv = document.getElementById('gantt-chart');
+            const timelineDiv = document.getElementById('gantt-timeline');
+            chartDiv.innerHTML = '';
+            timelineDiv.innerHTML = '';
+
+            if (tasks.length === 0) {
+                chartDiv.innerHTML = '<p class="text-center text-gray-500">タスクがありません。</p>';
+                return;
+            }
+
+            // Find min/max dates
+            const allDates = tasks.flatMap(t => [t.startDate, t.endDate]).filter(Boolean);
+            if (allDates.length === 0) return;
+            const minDate = new Date(Math.min(...allDates.map(d => new Date(d))));
+            const maxDate = new Date(Math.max(...allDates.map(d => new Date(d))));
+
+            // Ensure we have a valid date range
+            if (isNaN(minDate.getTime()) || isNaN(maxDate.getTime())) return;
+
+            // Generate timeline
+            const days = Math.floor((maxDate - minDate) / (1000 * 60 * 60 * 24)) + 1;
+            const timelineWidth = days * 50; // 50px per day
+            timelineDiv.style.width = `${timelineWidth}px`;
+            
+            const timelineContainer = document.createElement('div');
+            timelineContainer.className = 'gantt-timeline';
+            for (let i = 0; i <= days; i++) {
+                const day = new Date(minDate);
+                day.setDate(minDate.getDate() + i);
+                const timelineDay = document.createElement('div');
+                timelineDay.className = 'timeline-day';
+                timelineDay.style.width = '50px';
+                timelineDay.innerText = `${day.getMonth() + 1}/${day.getDate()}`;
+                timelineContainer.appendChild(timelineDay);
+            }
+            timelineDiv.appendChild(timelineContainer);
+
+            // Generate task bars
+            tasks.forEach(task => {
+                const startDate = new Date(task.startDate);
+                const endDate = new Date(task.endDate);
+
+                if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) return;
+
+                const startOffsetDays = (startDate - minDate) / (1000 * 60 * 60 * 24);
+                const durationDays = (endDate - startDate) / (1000 * 60 * 60 * 24) + 1;
+
+                const bar = document.createElement('div');
+                bar.className = 'gantt-bar flex items-center justify-center text-xs text-white px-2 shadow-md';
+                bar.classList.add(getStatusColorClass(task.status));
+                bar.style.left = `${startOffsetDays * 50 + 150}px`; // 150px is the label width
+                bar.style.width = `${durationDays * 50}px`;
+                bar.innerText = task.taskName;
+                
+                const taskRow = document.createElement('div');
+                taskRow.className = 'gantt-row';
+
+                const label = document.createElement('div');
+                label.className = 'gantt-row-label truncate';
+                label.innerText = task.taskName;
+                
+                taskRow.appendChild(label);
+                taskRow.appendChild(bar);
+                chartDiv.appendChild(taskRow);
+            });
+        }
+        
+        function getStatusColorClass(status) {
+            switch(status) {
+                case '未着手': return 'bg-gray-200 text-gray-800';
+                case '進行中': return 'bg-blue-200 text-blue-800';
+                case '完了': return 'bg-green-200 text-green-800';
+                default: return '';
+            }
+        }
+
+        // --- Modal Functions ---
+        const modal = document.getElementById('edit-modal');
+        const taskIdInput = document.getElementById('edit-task-id');
+        const taskNameInput = document.getElementById('edit-task-name');
+        const assigneeInput = document.getElementById('edit-assignee');
+        const startDateInput = document.getElementById('edit-start-date');
+        const endDateInput = document.getElementById('edit-end-date');
+        const statusInput = document.getElementById('edit-status');
+
+        window.openModal = function() {
+            modal.classList.remove('hidden');
+        }
+
+        window.closeModal = function() {
+            modal.classList.add('hidden');
+        }
+
+        window.editTaskModal = function(id, name, assignee, start, end, status) {
+            taskIdInput.value = id;
+            taskNameInput.value = name;
+            assigneeInput.value = assignee;
+            startDateInput.value = start;
+            endDateInput.value = end;
+            statusInput.value = status;
+            openModal();
+        }
+
+        window.updateTaskFromModal = function() {
+            const id = taskIdInput.value;
+            const updatedTask = {
+                taskName: taskNameInput.value,
+                assignee: assigneeInput.value,
+                startDate: startDateInput.value,
+                endDate: endDateInput.value,
+                status: statusInput.value
+            };
+            if (id) {
+                updateTask(id, updatedTask);
+            }
+        }
+        
+        // --- Event Listeners ---
+        window.deleteTask = deleteTask;
+        window.editTaskModal = editTaskModal;
+    </script>
+
+    <div class="max-w-7xl mx-auto bg-white p-8 rounded-xl shadow-2xl space-y-8">
+        <!-- Header -->
+        <div class="flex flex-col sm:flex-row items-center justify-between pb-4 border-b border-gray-200">
+            <h1 class="text-3xl font-bold text-gray-800 mb-2 sm:mb-0">タスク＆ガントチャート</h1>
+            <div id="user-id-display" class="text-sm text-gray-500 font-medium truncate">初期化中...</div>
+        </div>
+
+        <!-- Task Input Form -->
+        <div class="bg-gray-50 p-6 rounded-lg shadow-inner">
+            <h2 class="text-xl font-semibold text-gray-700 mb-4">新しいタスクを追加</h2>
+            <form id="task-form" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+                <input type="text" id="taskName" name="taskName" placeholder="タスク名" required class="p-3 border border-gray-300 rounded-md focus:ring focus:ring-blue-200 focus:outline-none">
+                <input type="text" id="assignee" name="assignee" placeholder="担当者" required class="p-3 border border-gray-300 rounded-md focus:ring focus:ring-blue-200 focus:outline-none">
+                <input type="date" id="startDate" name="startDate" required class="p-3 border border-gray-300 rounded-md focus:ring focus:ring-blue-200 focus:outline-none">
+                <input type="date" id="endDate" name="endDate" required class="p-3 border border-gray-300 rounded-md focus:ring focus:ring-blue-200 focus:outline-none">
+                <select id="status" name="status" class="p-3 border border-gray-300 rounded-md focus:ring focus:ring-blue-200 focus:outline-none">
+                    <option value="未着手">未着手</option>
+                    <option value="進行中">進行中</option>
+                    <option value="完了">完了</option>
+                </select>
+                <button type="submit" class="sm:col-span-2 lg:col-span-5 p-3 bg-blue-600 text-white font-semibold rounded-md hover:bg-blue-700 transition-colors duration-200 flex items-center justify-center space-x-2">
+                    <i class="fas fa-plus"></i> <span>タスクを追加</span>
+                </button>
+            </form>
+        </div>
+        
+        <!-- Task List Table -->
+        <div class="overflow-hidden shadow-md rounded-lg">
+            <h2 class="text-xl font-semibold text-gray-700 mb-4 p-4">タスク一覧</h2>
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm text-left text-gray-500">
+                    <thead class="text-xs text-gray-700 uppercase bg-gray-200">
+                        <tr>
+                            <th scope="col" class="px-6 py-3">タスク名</th>
+                            <th scope="col" class="px-6 py-3">担当者</th>
+                            <th scope="col" class="px-6 py-3">開始日</th>
+                            <th scope="col" class="px-6 py-3">終了日</th>
+                            <th scope="col" class="px-6 py-3">ステータス</th>
+                            <th scope="col" class="px-6 py-3">
+                                <span class="sr-only">アクション</span>
+                            </th>
+                        </tr>
+                    </thead>
+                    <tbody id="task-list">
+                        <!-- Task rows will be rendered here by JavaScript -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Gantt Chart Section -->
+        <div>
+            <h2 class="text-xl font-semibold text-gray-700 mb-4">ガントチャート</h2>
+            <div class="gantt-chart-container">
+                <div id="gantt-timeline"></div>
+                <div id="gantt-chart" class="relative">
+                    <!-- Gantt chart will be rendered here by JavaScript -->
+                    <p class="text-center text-gray-500">タスクを追加するとガントチャートが表示されます。</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit Modal -->
+    <div id="edit-modal" class="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center p-4 hidden">
+        <div class="modal-content w-full max-w-lg">
+            <h3 class="text-2xl font-bold text-gray-800 mb-6">タスクを編集</h3>
+            <form id="edit-form" onsubmit="event.preventDefault(); updateTaskFromModal();" class="space-y-4">
+                <input type="hidden" id="edit-task-id">
+                <div>
+                    <label for="edit-task-name" class="block text-sm font-medium text-gray-700">タスク名</label>
+                    <input type="text" id="edit-task-name" required class="mt-1 block w-full p-3 border border-gray-300 rounded-md focus:ring focus:ring-blue-200 focus:outline-none">
+                </div>
+                <div>
+                    <label for="edit-assignee" class="block text-sm font-medium text-gray-700">担当者</label>
+                    <input type="text" id="edit-assignee" required class="mt-1 block w-full p-3 border border-gray-300 rounded-md focus:ring focus:ring-blue-200 focus:outline-none">
+                </div>
+                <div>
+                    <label for="edit-start-date" class="block text-sm font-medium text-gray-700">開始日</label>
+                    <input type="date" id="edit-start-date" required class="mt-1 block w-full p-3 border border-gray-300 rounded-md focus:ring focus:ring-blue-200 focus:outline-none">
+                </div>
+                <div>
+                    <label for="edit-end-date" class="block text-sm font-medium text-gray-700">終了日</label>
+                    <input type="date" id="edit-end-date" required class="mt-1 block w-full p-3 border border-gray-300 rounded-md focus:ring focus:ring-blue-200 focus:outline-none">
+                </div>
+                <div>
+                    <label for="edit-status" class="block text-sm font-medium text-gray-700">ステータス</label>
+                    <select id="edit-status" class="mt-1 block w-full p-3 border border-gray-300 rounded-md focus:ring focus:ring-blue-200 focus:outline-none">
+                        <option value="未着手">未着手</option>
+                        <option value="進行中">進行中</option>
+                        <option value="完了">完了</option>
+                    </select>
+                </div>
+                <div class="flex justify-end space-x-4 mt-6">
+                    <button type="button" onclick="closeModal()" class="px-6 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50 transition-colors duration-200">キャンセル</button>
+                    <button type="submit" class="px-6 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors duration-200">更新</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
